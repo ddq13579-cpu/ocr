@@ -38,4 +38,4 @@ docker compose logs -f worker
 
 ## 依赖说明
 
-Worker 固定使用 PaddleOCR 3.1.0、PaddleX 3.1.0 与 PaddlePaddle 3.0.0 的非 GPU 组合，使用更快的 PP-OCRv5 mobile 检测/识别模型、PaddleOCR 3.x `predict` API，且每个 Worker 进程仅延迟初始化一次 OCR 模型。图片仅在 OCR 前临时缩放到最长边 2500 像素（可用 `OCR_MAX_SIDE` 调整），原始上传文件不会被修改。Worker 每 0.25 秒轮询一次待处理任务，降低上传后的排队延迟。模型文件持久化在 [data/paddle_models](./data/paddle_models)，避免容器重建后重复下载。Gemini 默认模型为 `gemini-3.5-flash-lite`，使用 Google 官方 `google-genai` SDK 的 `response_schema` 和 `application/json` 响应类型；针对瞬时 SSL 连接中断会自动有限次退避重试。API Key 仅从环境变量读取，不应提交 `.env`。
+Worker 固定使用 PaddleOCR 3.1.0、PaddleX 3.1.0 与 PaddlePaddle 3.0.0 的非 GPU 组合，使用更快的 PP-OCRv5 mobile 检测/识别模型和 PaddleOCR 3.x `predict` API。每个待处理批次先以 1 条并发（`OCR_CONCURRENCY`）完成所有 OCR，再以 20 条并发（`GEMINI_CONCURRENCY`）调用 Gemini；每个 OCR 线程有独立推理实例，避免并发共享模型状态。图片仅在 OCR 前临时缩放到最长边 2500 像素（可用 `OCR_MAX_SIDE` 调整），原始上传文件不会被修改。Worker 每 0.25 秒轮询一次待处理任务，降低上传后的排队延迟。模型文件持久化在 [data/paddle_models](./data/paddle_models)，避免容器重建后重复下载。Gemini 默认模型为 `gemini-3.5-flash-lite`，使用 Google 官方 `google-genai` SDK 的 `response_schema` 和 `application/json` 响应类型；针对瞬时 SSL 连接中断会自动有限次退避重试。API Key 仅从环境变量读取，不应提交 `.env`。
