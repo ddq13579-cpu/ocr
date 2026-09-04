@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+frontend/dist/
+data/uploads/*
+!data/uploads/.gitkeep
+data/database/*
+!data/database/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+data/paddle_models/*
+!data/paddle_models/.gitkeep

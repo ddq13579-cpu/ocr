@@ -1,0 +1,235 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { ElMessage, ElMessageBox } from "element-plus";
+import api from "./api";
+import { AxiosError } from "axios";
+
+type Field = { field_name: string; field_key: string; field_type: "text" | "number" | "date" | "boolean"; description: string; required: boolean; sort_order: number };
+type Template = { id: number; name: string; description: string; fields: Field[] };
+type SelectedFile = { file: File; path: string };
+type Document = { id: number; filename: string; relative_path: string; file_type: string; status: string; template_id: number; updated_at: string; error_message?: string };
+type RecordItem = { id: number; document_id: number; template_id: number; status: string; json_data: Record<string, unknown>; updated_at: string };
+
+const page = ref<"upload" | "templates" | "results">("upload");
+const templates = ref<Template[]>([]);
+const selectedTemplateId = ref<number>();
+const selectedFiles = ref<SelectedFile[]>([]);
+const documents = ref<Document[]>([]);
+const records = ref<RecordItem[]>([]);
+const editingTemplate = ref<Template | null>(null);
+const dialogVisible = ref(false);
+const selectedRecord = ref<RecordItem | null>(null);
+const rawText = ref("");
+const textDialogVisible = ref(false);
+
+const selectedTemplate = computed(() => templates.value.find((template) => template.id === selectedTemplateId.value));
+const recordFields = computed(() => templates.value.find((template) => template.id === selectedRecord.value?.template_id)?.fields ?? []);
+
+async function refresh() {
+  const [templateResponse, documentResponse, recordResponse] = await Promise.all([api.get<Template[]>("/templates"), api.get<Document[]>("/documents"), api.get<RecordItem[]>("/records")]);
+  templates.value = templateResponse.data;
+  documents.value = documentResponse.data;
+  records.value = recordResponse.data;
+  if (!selectedTemplateId.value && templates.value[0]) selectedTemplateId.value = templates.value[0].id;
+}
+
+function addFiles(files: FileList | File[]) {
+  const additions = Array.from(files).map((file) => ({ file, path: file.webkitRelativePath || file.name }));
+  selectedFiles.value = [...selectedFiles.value, ...additions];
+}
+
+async function dropFiles(event: DragEvent) {
+  event.preventDefault();
+  if (event.dataTransfer?.files) addFiles(event.dataTransfer.files);
+}
+
+async function upload() {
+  if (!selectedTemplateId.value) return ElMessage.warning("请先选择提取模板");
+  if (!selectedFiles.value.length) return ElMessage.warning("请选择文件或文件夹");
+  const body = new FormData();
+  body.append("template_id", String(selectedTemplateId.value));
+  selectedFiles.value.forEach(({ file, path }) => { body.append("files", file); body.append("relative_paths", path); });
+  const response = await api.post("/files/upload", body);
+  selectedFiles.value = [];
+  await refresh();
+  if (response.data.uploaded.length) await api.post("/files/process", response.data.uploaded.map((item: { id: number }) => item.id));
+  ElMessage.success(`已加入 ${response.data.uploaded.length} 个文件；重复或跳过 ${response.data.duplicates.length + response.data.skipped.length} 个`);
+  window.setTimeout(refresh, 1500);
+}
+
+function newTemplate() {
+  editingTemplate.value = { id: 0, name: "", description: "", fields: [] };
+  dialogVisible.value = true;
+}
+function editTemplate(template: Template) {
+  editingTemplate.value = structuredClone(template);
+  dialogVisible.value = true;
+}
+function addField() {
+  if (!editingTemplate.value) return;
+  const existingKeys = new Set(editingTemplate.value.fields.map((field) => field.field_key));
+  let number = editingTemplate.value.fields.length + 1;
+  while (existingKeys.has(`field_${number}`)) number += 1;
+  editingTemplate.value.fields.push({
+    field_name: "",
+    field_key: `field_${number}`,
+    field_type: "text",
+    description: "",
+    required: false,
+    sort_order: editingTemplate.value.fields.length,
+  });
+}
+function moveField(index: number, offset: number) {
+  if (!editingTemplate.value) return;
+  const target = index + offset;
+  if (target < 0 || target >= editingTemplate.value.fields.length) return;
+  const [field] = editingTemplate.value.fields.splice(index, 1);
+  editingTemplate.value.fields.splice(target, 0, field);
+  editingTemplate.value.fields.forEach((item, order) => { item.sort_order = order; });
+}
+async function saveTemplate() {
+  if (!editingTemplate.value) return;
+  if (!editingTemplate.value.name.trim()) {
+    ElMessage.warning("请填写模板名称");
+    return;
+  }
+  const invalidField = editingTemplate.value.fields.find((field) => !field.field_name.trim() || !field.field_key.trim());
+  if (invalidField) {
+    ElMessage.warning("请填写每个字段的中文名称；field_key 已自动生成，可保留不改");
+    return;
+  }
+  const { id, ...payload } = editingTemplate.value;
+  try {
+    const response = id ? await api.put<Template>(`/templates/${id}`, payload) : await api.post<Template>("/templates", payload);
+    selectedTemplateId.value = response.data.id;
+    dialogVisible.value = false;
+    await refresh();
+    ElMessage.success("模板已保存");
+  } catch (error) {
+    const detail = error instanceof AxiosError ? error.response?.data?.detail : undefined;
+    ElMessage.error(typeof detail === "string" ? detail : "保存模板失败，请检查字段名称和 field_key");
+  }
+}
+async function deleteTemplate(template: Template) {
+  try {
+    await ElMessageBox.confirm(`删除模板“${template.name}”？`, "确认删除", {
+      type: "warning",
+      confirmButtonText: "删除",
+      cancelButtonText: "取消",
+    });
+    await api.delete(`/templates/${template.id}`);
+    if (selectedTemplateId.value === template.id) selectedTemplateId.value = undefined;
+    await refresh();
+    ElMessage.success("模板已删除");
+  } catch (error) {
+    if (error === "cancel" || error === "close") return;
+    const detail = error instanceof AxiosError ? error.response?.data?.detail : undefined;
+    ElMessage.error(typeof detail === "string" ? detail : "删除模板失败");
+  }
+}
+async function selectRecord(record: RecordItem) {
+  selectedRecord.value = structuredClone(record);
+}
+async function showRawText(documentId: number) {
+  const response = await api.get<{ raw_text: string | null }>(`/documents/${documentId}`);
+  rawText.value = response.data.raw_text || "该文件尚未完成文字提取。";
+  textDialogVisible.value = true;
+}
+async function saveRecord() {
+  if (!selectedRecord.value) return;
+  await api.put(`/records/${selectedRecord.value.id}`, { json_data: selectedRecord.value.json_data });
+  ElMessage.success("结果已保存");
+  await refresh();
+}
+async function retryDocument(documentId: number) {
+  await api.post("/files/process", [documentId]);
+  ElMessage.success("文件已重新加入处理队列");
+  await refresh();
+}
+async function deleteDocument(document: Document) {
+  try {
+    await ElMessageBox.confirm(
+      `删除任务“${document.filename}”及其原始文件、OCR 文字和结构化结果？此操作无法恢复。`,
+      "确认删除任务",
+      { type: "warning", confirmButtonText: "删除任务", cancelButtonText: "取消" },
+    );
+    await api.delete(`/documents/${document.id}`);
+    if (selectedRecord.value?.document_id === document.id) selectedRecord.value = null;
+    ElMessage.success("任务已删除");
+    await refresh();
+  } catch (error) {
+    if (error === "cancel" || error === "close") return;
+    const detail = error instanceof AxiosError ? error.response?.data?.detail : undefined;
+    ElMessage.error(typeof detail === "string" ? detail : "删除任务失败");
+  }
+}
+function exportExcel() {
+  if (!selectedTemplateId.value) return ElMessage.warning("请选择模板");
+  window.open(`/api/export/excel?template_id=${selectedTemplateId.value}`, "_blank");
+}
+function openDocument(documentId: number) {
+  window.open(`/api/documents/${documentId}/file`, "_blank");
+}
+function recordValue(key: string): string {
+  const value = selectedRecord.value?.json_data[key];
+  return value === null || value === undefined ? "" : String(value);
+}
+function updateRecordValue(key: string, value: string) {
+  if (selectedRecord.value) selectedRecord.value.json_data[key] = value;
+}
+let refreshTimer: number | undefined;
+onMounted(async () => {
+  await refresh();
+  refreshTimer = window.setInterval(() => void refresh(), 5000);
+});
+onBeforeUnmount(() => {
+  if (refreshTimer) window.clearInterval(refreshTimer);
+});
+</script>
+
+<template>
+  <el-container class="shell">
+    <el-header><strong>文档智能整理系统</strong><el-menu mode="horizontal" :default-active="page" @select="(value: string) => page = value as 'upload' | 'templates' | 'results'">
+      <el-menu-item index="upload">文件处理</el-menu-item><el-menu-item index="templates">模板管理</el-menu-item><el-menu-item index="results">处理结果</el-menu-item>
+    </el-menu></el-header>
+    <el-main>
+      <section v-if="page === 'upload'" class="panel">
+        <h2>上传并处理文件</h2>
+        <el-select v-model="selectedTemplateId" placeholder="选择提取模板"><el-option v-for="template in templates" :key="template.id" :label="template.name" :value="template.id" /></el-select>
+        <div class="dropzone" @dragover.prevent @drop="dropFiles">
+          <div>将文件或文件夹拖到这里，或点击选择</div><small>支持 PDF / JPG / PNG / WEBP / BMP / TIFF / HEIC</small>
+        </div>
+        <input type="file" multiple webkitdirectory @change="addFiles(($event.target as HTMLInputElement).files!)" />
+        <p>已选择 {{ selectedFiles.length }} 个文件</p>
+        <el-button type="primary" :disabled="!templates.length" @click="upload">开始处理</el-button>
+      </section>
+
+      <section v-else-if="page === 'templates'" class="panel">
+        <el-button type="primary" @click="newTemplate">创建模板</el-button>
+        <el-table :data="templates" class="spaced"><el-table-column prop="name" label="名称" /><el-table-column prop="description" label="说明" /><el-table-column label="字段数"><template #default="{ row }">{{ row.fields.length }}</template></el-table-column><el-table-column label="操作"><template #default="{ row }"><el-button link @click="editTemplate(row)">编辑</el-button><el-button link type="danger" @click="deleteTemplate(row)">删除</el-button></template></el-table-column></el-table>
+      </section>
+
+      <section v-else class="result-layout">
+        <div class="panel"><el-button @click="refresh">刷新状态</el-button><el-button class="right" type="success" @click="exportExcel">导出当前模板 Excel</el-button>
+          <el-table :data="documents" class="spaced"><el-table-column prop="filename" label="文件名" /><el-table-column prop="relative_path" label="来源目录" /><el-table-column prop="file_type" label="类型" /><el-table-column prop="status" label="状态" /><el-table-column label="查看"><template #default="{ row }"><el-button link @click="openDocument(row.id)">原文件</el-button><el-button link @click="showRawText(row.id)">原始文字</el-button><el-button v-if="row.status === 'failed'" link type="warning" @click="retryDocument(row.id)">重新处理</el-button><el-button link type="danger" :disabled="row.status === 'processing' || row.status === 'ai_processing'" @click="deleteDocument(row)">删除任务</el-button></template></el-table-column></el-table>
+        </div>
+        <div class="panel"><h3>结构化结果</h3><el-table :data="records" @row-click="selectRecord"><el-table-column prop="id" label="ID" /><el-table-column prop="document_id" label="文档" /><el-table-column prop="status" label="状态" /></el-table>
+          <template v-if="selectedRecord"><h4>编辑记录 #{{ selectedRecord.id }}</h4><el-form label-width="120px"><el-form-item v-for="field in recordFields" :key="field.field_key" :label="field.field_name"><el-input :model-value="recordValue(field.field_key)" @update:model-value="updateRecordValue(field.field_key, $event)" /></el-form-item></el-form><el-button type="primary" @click="saveRecord">保存</el-button></template>
+        </div>
+      </section>
+    </el-main>
+  </el-container>
+
+  <el-dialog v-model="dialogVisible" title="模板">
+    <el-form v-if="editingTemplate" label-width="90px"><el-form-item label="名称"><el-input v-model="editingTemplate.name" /></el-form-item><el-form-item label="说明"><el-input v-model="editingTemplate.description" /></el-form-item>
+      <h3>提取字段 <el-button link type="primary" @click="addField">添加字段</el-button></h3>
+      <p class="field-help">点击“添加字段”后，只需填写中文字段名称。field_key 是系统标识，已自动生成（如 field_1），可直接保留。</p>
+      <div v-for="(field, index) in editingTemplate.fields" :key="index" class="field-row"><el-input v-model="field.field_name" placeholder="中文字段名称，例如：姓名" /><el-input v-model="field.field_key" placeholder="系统标识（自动生成，可保留）" /><el-select v-model="field.field_type"><el-option value="text" label="文本" /><el-option value="number" label="数字" /><el-option value="date" label="日期" /><el-option value="boolean" label="布尔" /></el-select><el-input v-model="field.description" placeholder="字段说明（可选）" /><el-checkbox v-model="field.required">必填</el-checkbox><el-button link :disabled="index === 0" @click="moveField(index, -1)">上移</el-button><el-button link :disabled="index === editingTemplate.fields.length - 1" @click="moveField(index, 1)">下移</el-button><el-button link type="danger" @click="editingTemplate.fields.splice(index, 1)">删除</el-button></div>
+    </el-form><template #footer><el-button @click="dialogVisible = false">取消</el-button><el-button type="primary" @click="saveTemplate">保存</el-button></template>
+  </el-dialog>
+  <el-dialog v-model="textDialogVisible" title="原始文字" width="70%"><pre class="raw-text">{{ rawText }}</pre></el-dialog>
+</template>
+
+<style scoped>
+.shell { min-height: 100vh; background: #f5f7fa; }.el-header { display: flex; align-items: center; gap: 36px; background: white; border-bottom: 1px solid #ddd; }.el-menu { border: 0; flex: 1; }.panel { background: white; padding: 24px; border-radius: 8px; }.dropzone { margin: 20px 0; padding: 42px; border: 2px dashed #a8abb2; border-radius: 8px; text-align: center; color: #606266; }.spaced { margin-top: 20px; }.result-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }.right { float: right; }.field-help { color: #909399; font-size: 13px; }.field-row { display: grid; grid-template-columns: 1.1fr 1.1fr 100px 1.4fr 70px repeat(3, auto); gap: 8px; margin: 8px 0; }.raw-text { max-height: 60vh; overflow: auto; white-space: pre-wrap; } @media (max-width: 800px) { .result-layout { grid-template-columns: 1fr; }.field-row { grid-template-columns: 1fr; } }
+</style>
