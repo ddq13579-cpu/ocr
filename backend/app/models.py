@@ -47,6 +47,7 @@ class Document(Timestamped, Base):
     sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     folder_level_1: Mapped[str | None] = mapped_column(String(255), nullable=True)
     folder_level_2: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    folder_level_3: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     template_id: Mapped[int | None] = mapped_column(ForeignKey("templates.id"), nullable=True)

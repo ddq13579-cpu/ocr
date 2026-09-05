@@ -10,6 +10,12 @@ type SelectedFile = { file: File; path: string };
 type Document = { id: number; filename: string; relative_path: string; file_type: string; status: string; template_id: number; updated_at: string; error_message?: string };
 type RecordItem = { id: number; document_id: number; template_id: number; status: string; json_data: Record<string, unknown>; updated_at: string };
 
+const isAuthenticated = ref(false);
+const username = ref("");
+const loginUsername = ref("");
+const loginPassword = ref("");
+const loginLoading = ref(false);
+
 const page = ref<"upload" | "templates" | "results">("upload");
 const templates = ref<Template[]>([]);
 const selectedTemplateId = ref<number>();
@@ -24,6 +30,56 @@ const textDialogVisible = ref(false);
 
 const selectedTemplate = computed(() => templates.value.find((template) => template.id === selectedTemplateId.value));
 const recordFields = computed(() => templates.value.find((template) => template.id === selectedRecord.value?.template_id)?.fields ?? []);
+
+async function login() {
+  if (!loginUsername.value.trim() || !loginPassword.value.trim()) {
+    return ElMessage.warning("请输入账号和密码");
+  }
+  loginLoading.value = true;
+  try {
+    const res = await api.post<{ token: string; username: string }>("/auth/login", {
+      username: loginUsername.value.trim(),
+      password: loginPassword.value.trim(),
+    });
+    localStorage.setItem("token", res.data.token);
+    username.value = res.data.username;
+    isAuthenticated.value = true;
+    loginPassword.value = "";
+    ElMessage.success("登录成功");
+    await refresh();
+    startPolling();
+  } catch (error) {
+    const detail = error instanceof AxiosError ? error.response?.data?.detail : undefined;
+    ElMessage.error(typeof detail === "string" ? detail : "账号或密码错误");
+  } finally {
+    loginLoading.value = false;
+  }
+}
+
+function logout() {
+  localStorage.removeItem("token");
+  isAuthenticated.value = false;
+  stopPolling();
+  ElMessage.info("已安全退出系统");
+}
+
+async function checkAuth() {
+  const token = localStorage.getItem("token");
+  if (!token) {
+    isAuthenticated.value = false;
+    return;
+  }
+  try {
+    const res = await api.get<{ username: string }>("/auth/check");
+    username.value = res.data.username;
+    isAuthenticated.value = true;
+    await refresh();
+    startPolling();
+  } catch {
+    localStorage.removeItem("token");
+    isAuthenticated.value = false;
+  }
+}
 
 async function refresh() {
   const [templateResponse, documentResponse, recordResponse] = await Promise.all([api.get<Template[]>("/templates"), api.get<Document[]>("/documents"), api.get<RecordItem[]>("/records")]);
@@ -62,7 +118,14 @@ function newTemplate() {
   dialogVisible.value = true;
 }
 function editTemplate(template: Template) {
-  editingTemplate.value = structuredClone(template);
+  editingTemplate.value = JSON.parse(JSON.stringify(template));
+  dialogVisible.value = true;
+}
+function duplicateTemplate(template: Template) {
+  const copy: Template = JSON.parse(JSON.stringify(template));
+  copy.id = 0;
+  copy.name = `${template.name} - 副本`;
+  editingTemplate.value = copy;
   dialogVisible.value = true;
 }
 function addField() {
@@ -98,7 +161,19 @@ async function saveTemplate() {
     ElMessage.warning("请填写每个字段的中文名称；field_key 已自动生成，可保留不改");
     return;
   }
-  const { id, ...payload } = editingTemplate.value;
+  const payload = {
+    name: editingTemplate.value.name.trim(),
+    description: editingTemplate.value.description,
+    fields: editingTemplate.value.fields.map((field, index) => ({
+      field_name: field.field_name.trim(),
+      field_key: field.field_key.trim(),
+      field_type: field.field_type,
+      description: field.description || "",
+      required: Boolean(field.required),
+      sort_order: index,
+    })),
+  };
+  const id = editingTemplate.value.id;
   try {
     const response = id ? await api.put<Template>(`/templates/${id}`, payload) : await api.post<Template>("/templates", payload);
     selectedTemplateId.value = response.data.id;
@@ -128,7 +203,7 @@ async function deleteTemplate(template: Template) {
   }
 }
 async function selectRecord(record: RecordItem) {
-  selectedRecord.value = structuredClone(record);
+  selectedRecord.value = JSON.parse(JSON.stringify(record));
 }
 async function showRawText(documentId: number) {
   const response = await api.get<{ raw_text: string | null }>(`/documents/${documentId}`);
@@ -163,12 +238,32 @@ async function deleteDocument(document: Document) {
     ElMessage.error(typeof detail === "string" ? detail : "删除任务失败");
   }
 }
+async function deleteAllDocuments() {
+  if (!documents.value.length) return ElMessage.warning("当前没有任务可删除");
+  try {
+    await ElMessageBox.confirm(
+      "确认删除所有任务及其原始文件、OCR 文字和提取结果？此操作无法恢复。",
+      "确认一键删除所有任务",
+      { type: "warning", confirmButtonText: "一键删除", cancelButtonText: "取消" },
+    );
+    const response = await api.delete<{ deleted: number; skipped: number }>("/documents");
+    selectedRecord.value = null;
+    ElMessage.success(`已删除 ${response.data.deleted} 个任务${response.data.skipped ? `；跳过 ${response.data.skipped} 个正在处理的任务` : ""}`);
+    await refresh();
+  } catch (error) {
+    if (error === "cancel" || error === "close") return;
+    const detail = error instanceof AxiosError ? error.response?.data?.detail : undefined;
+    ElMessage.error(typeof detail === "string" ? detail : "一键删除任务失败");
+  }
+}
 function exportExcel() {
   if (!selectedTemplateId.value) return ElMessage.warning("请选择模板");
-  window.open(`/api/export/excel?template_id=${selectedTemplateId.value}`, "_blank");
+  const token = localStorage.getItem("token") || "";
+  window.open(`/api/export/excel?template_id=${selectedTemplateId.value}&token=${encodeURIComponent(token)}`, "_blank");
 }
 function openDocument(documentId: number) {
-  window.open(`/api/documents/${documentId}/file`, "_blank");
+  const token = localStorage.getItem("token") || "";
+  window.open(`/api/documents/${documentId}/file?token=${encodeURIComponent(token)}`, "_blank");
 }
 function recordValue(key: string): string {
   const value = selectedRecord.value?.json_data[key];
@@ -177,59 +272,134 @@ function recordValue(key: string): string {
 function updateRecordValue(key: string, value: string) {
   if (selectedRecord.value) selectedRecord.value.json_data[key] = value;
 }
+
 let refreshTimer: number | undefined;
-onMounted(async () => {
-  await refresh();
+
+function startPolling() {
+  stopPolling();
   refreshTimer = window.setInterval(() => void refresh(), 5000);
+}
+
+function stopPolling() {
+  if (refreshTimer) {
+    window.clearInterval(refreshTimer);
+    refreshTimer = undefined;
+  }
+}
+
+function handleAuthExpired() {
+  isAuthenticated.value = false;
+  stopPolling();
+  ElMessage.warning("登录凭证已失效，请重新登录");
+}
+
+onMounted(async () => {
+  window.addEventListener("auth-expired", handleAuthExpired);
+  await checkAuth();
 });
+
 onBeforeUnmount(() => {
-  if (refreshTimer) window.clearInterval(refreshTimer);
+  window.removeEventListener("auth-expired", handleAuthExpired);
+  stopPolling();
 });
 </script>
 
 <template>
-  <el-container class="shell">
-    <el-header><strong>文档智能整理系统</strong><el-menu mode="horizontal" :default-active="page" @select="(value: string) => page = value as 'upload' | 'templates' | 'results'">
-      <el-menu-item index="upload">文件处理</el-menu-item><el-menu-item index="templates">模板管理</el-menu-item><el-menu-item index="results">处理结果</el-menu-item>
-    </el-menu></el-header>
-    <el-main>
-      <section v-if="page === 'upload'" class="panel">
-        <h2>上传并处理文件</h2>
-        <el-select v-model="selectedTemplateId" placeholder="选择提取模板"><el-option v-for="template in templates" :key="template.id" :label="template.name" :value="template.id" /></el-select>
-        <div class="dropzone" @dragover.prevent @drop="dropFiles">
-          <div>将文件或文件夹拖到这里，或点击选择</div><small>支持 PDF / JPG / PNG / WEBP / BMP / TIFF / HEIC</small>
+  <div v-if="!isAuthenticated" class="login-wrapper">
+    <el-card class="login-card">
+      <template #header>
+        <div class="login-header">
+          <h2>文档智能整理系统</h2>
+          <p>请先验证账号密码以继续访问</p>
         </div>
-        <input type="file" multiple webkitdirectory @change="addFiles(($event.target as HTMLInputElement).files!)" />
-        <p>已选择 {{ selectedFiles.length }} 个文件</p>
-        <el-button type="primary" :disabled="!templates.length" @click="upload">开始处理</el-button>
-      </section>
+      </template>
+      <el-form @keyup.enter="login" label-position="top">
+        <el-form-item label="账号">
+          <el-input v-model="loginUsername" placeholder="请输入管理员账号" size="large" clearable />
+        </el-form-item>
+        <el-form-item label="密码">
+          <el-input v-model="loginPassword" type="password" placeholder="请输入密码" size="large" show-password clearable />
+        </el-form-item>
+        <el-button type="primary" size="large" class="login-btn" :loading="loginLoading" @click="login">
+          安全登录
+        </el-button>
+      </el-form>
+    </el-card>
+  </div>
 
-      <section v-else-if="page === 'templates'" class="panel">
-        <el-button type="primary" @click="newTemplate">创建模板</el-button>
-        <el-table :data="templates" class="spaced"><el-table-column prop="name" label="名称" /><el-table-column prop="description" label="说明" /><el-table-column label="字段数"><template #default="{ row }">{{ row.fields.length }}</template></el-table-column><el-table-column label="操作"><template #default="{ row }"><el-button link @click="editTemplate(row)">编辑</el-button><el-button link type="danger" @click="deleteTemplate(row)">删除</el-button></template></el-table-column></el-table>
-      </section>
+  <template v-else>
+    <el-container class="shell">
+      <el-header>
+        <strong>文档智能整理系统</strong>
+        <el-menu mode="horizontal" :default-active="page" @select="(value: string) => page = value as 'upload' | 'templates' | 'results'">
+          <el-menu-item index="upload">文件处理</el-menu-item>
+          <el-menu-item index="templates">模板管理</el-menu-item>
+          <el-menu-item index="results">处理结果</el-menu-item>
+        </el-menu>
+        <div class="user-info">
+          <span class="username">👤 {{ username }}</span>
+          <el-button size="small" type="info" plain @click="logout">退出登录</el-button>
+        </div>
+      </el-header>
+      <el-main>
+        <section v-if="page === 'upload'" class="panel">
+          <h2>上传并处理文件</h2>
+          <el-select v-model="selectedTemplateId" placeholder="选择提取模板"><el-option v-for="template in templates" :key="template.id" :label="template.name" :value="template.id" /></el-select>
+          <div class="dropzone" @dragover.prevent @drop="dropFiles">
+            <div>将文件或文件夹拖到这里，或点击选择</div><small>支持 PDF / JPG / PNG / WEBP / BMP / TIFF / HEIC</small>
+          </div>
+          <input type="file" multiple webkitdirectory @change="addFiles(($event.target as HTMLInputElement).files!)" />
+          <p>已选择 {{ selectedFiles.length }} 个文件</p>
+          <el-button type="primary" :disabled="!templates.length" @click="upload">开始处理</el-button>
+        </section>
 
-      <section v-else class="result-layout">
-        <div class="panel"><el-button @click="refresh">刷新状态</el-button><el-button class="right" type="success" @click="exportExcel">导出当前模板 Excel</el-button>
+        <section v-else-if="page === 'templates'" class="panel">
+          <el-button type="primary" @click="newTemplate">创建模板</el-button>
+          <el-table :data="templates" class="spaced"><el-table-column prop="name" label="名称" /><el-table-column prop="description" label="说明" /><el-table-column label="字段数"><template #default="{ row }">{{ row.fields.length }}</template></el-table-column><el-table-column label="操作"><template #default="{ row }"><el-button link @click="editTemplate(row)">编辑</el-button><el-button link @click="duplicateTemplate(row)">复制</el-button><el-button link type="danger" @click="deleteTemplate(row)">删除</el-button></template></el-table-column></el-table>
+        </section>
+
+        <section v-else class="panel">
+          <el-button @click="refresh">刷新状态</el-button>
+          <div class="right">
+            <el-button type="danger" style="margin-right: 12px" @click="deleteAllDocuments">一键删除所有任务</el-button>
+            <el-button type="success" @click="exportExcel">导出当前模板 Excel</el-button>
+          </div>
           <el-table :data="documents" class="spaced"><el-table-column prop="filename" label="文件名" /><el-table-column prop="relative_path" label="来源目录" /><el-table-column prop="file_type" label="类型" /><el-table-column prop="status" label="状态" /><el-table-column label="查看"><template #default="{ row }"><el-button link @click="openDocument(row.id)">原文件</el-button><el-button link @click="showRawText(row.id)">原始文字</el-button><el-button v-if="row.status === 'failed'" link type="warning" @click="retryDocument(row.id)">重新处理</el-button><el-button link type="danger" :disabled="row.status === 'processing' || row.status === 'ai_processing'" @click="deleteDocument(row)">删除任务</el-button></template></el-table-column></el-table>
-        </div>
-        <div class="panel"><h3>结构化结果</h3><el-table :data="records" @row-click="selectRecord"><el-table-column prop="id" label="ID" /><el-table-column prop="document_id" label="文档" /><el-table-column prop="status" label="状态" /></el-table>
-          <template v-if="selectedRecord"><h4>编辑记录 #{{ selectedRecord.id }}</h4><el-form label-width="120px"><el-form-item v-for="field in recordFields" :key="field.field_key" :label="field.field_name"><el-input :model-value="recordValue(field.field_key)" @update:model-value="updateRecordValue(field.field_key, $event)" /></el-form-item></el-form><el-button type="primary" @click="saveRecord">保存</el-button></template>
-        </div>
-      </section>
-    </el-main>
-  </el-container>
+        </section>
+      </el-main>
+    </el-container>
 
-  <el-dialog v-model="dialogVisible" title="模板">
-    <el-form v-if="editingTemplate" label-width="90px"><el-form-item label="名称"><el-input v-model="editingTemplate.name" /></el-form-item><el-form-item label="说明"><el-input v-model="editingTemplate.description" /></el-form-item>
-      <h3>提取字段 <el-button link type="primary" @click="addField">添加字段</el-button></h3>
-      <p class="field-help">点击“添加字段”后，只需填写中文字段名称。field_key 是系统标识，已自动生成（如 field_1），可直接保留。</p>
-      <div v-for="(field, index) in editingTemplate.fields" :key="index" class="field-row"><el-input v-model="field.field_name" placeholder="中文字段名称，例如：姓名" /><el-input v-model="field.field_key" placeholder="系统标识（自动生成，可保留）" /><el-select v-model="field.field_type"><el-option value="text" label="文本" /><el-option value="number" label="数字" /><el-option value="date" label="日期" /><el-option value="boolean" label="布尔" /></el-select><el-input v-model="field.description" placeholder="字段说明（可选）" /><el-checkbox v-model="field.required">必填</el-checkbox><el-button link :disabled="index === 0" @click="moveField(index, -1)">上移</el-button><el-button link :disabled="index === editingTemplate.fields.length - 1" @click="moveField(index, 1)">下移</el-button><el-button link type="danger" @click="editingTemplate.fields.splice(index, 1)">删除</el-button></div>
-    </el-form><template #footer><el-button @click="dialogVisible = false">取消</el-button><el-button type="primary" @click="saveTemplate">保存</el-button></template>
-  </el-dialog>
-  <el-dialog v-model="textDialogVisible" title="原始文字" width="70%"><pre class="raw-text">{{ rawText }}</pre></el-dialog>
+    <el-dialog v-model="dialogVisible" :title="editingTemplate?.id ? '编辑模板' : '创建模板'" destroy-on-close>
+      <el-form v-if="editingTemplate" label-width="90px"><el-form-item label="名称"><el-input v-model="editingTemplate.name" /></el-form-item><el-form-item label="说明"><el-input v-model="editingTemplate.description" /></el-form-item>
+        <h3>提取字段 <el-button link type="primary" @click="addField">添加字段</el-button></h3>
+        <p class="field-help">点击“添加字段”后，只需填写中文字段名称。field_key 是系统标识，已自动生成（如 field_1），可直接保留。</p>
+        <div v-for="(field, index) in editingTemplate.fields" :key="index" class="field-row"><el-input v-model="field.field_name" placeholder="中文字段名称，例如：姓名" /><el-input v-model="field.field_key" placeholder="系统标识（自动生成，可保留）" /><el-select v-model="field.field_type"><el-option value="text" label="文本" /><el-option value="number" label="数字" /><el-option value="date" label="日期" /><el-option value="boolean" label="布尔" /></el-select><el-input v-model="field.description" placeholder="字段说明（可选）" /><el-checkbox v-model="field.required">必填</el-checkbox><el-button link :disabled="index === 0" @click="moveField(index, -1)">上移</el-button><el-button link :disabled="index === editingTemplate.fields.length - 1" @click="moveField(index, 1)">下移</el-button><el-button link type="danger" @click="editingTemplate.fields.splice(index, 1)">删除</el-button></div>
+      </el-form><template #footer><el-button @click="dialogVisible = false">取消</el-button><el-button type="primary" @click="saveTemplate">保存</el-button></template>
+    </el-dialog>
+    <el-dialog v-model="textDialogVisible" title="原始文字" width="70%"><pre class="raw-text">{{ rawText }}</pre></el-dialog>
+  </template>
 </template>
 
 <style scoped>
-.shell { min-height: 100vh; background: #f5f7fa; }.el-header { display: flex; align-items: center; gap: 36px; background: white; border-bottom: 1px solid #ddd; }.el-menu { border: 0; flex: 1; }.panel { background: white; padding: 24px; border-radius: 8px; }.dropzone { margin: 20px 0; padding: 42px; border: 2px dashed #a8abb2; border-radius: 8px; text-align: center; color: #606266; }.spaced { margin-top: 20px; }.result-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }.right { float: right; }.field-help { color: #909399; font-size: 13px; }.field-row { display: grid; grid-template-columns: 1.1fr 1.1fr 100px 1.4fr 70px repeat(3, auto); gap: 8px; margin: 8px 0; }.raw-text { max-height: 60vh; overflow: auto; white-space: pre-wrap; } @media (max-width: 800px) { .result-layout { grid-template-columns: 1fr; }.field-row { grid-template-columns: 1fr; } }
+.login-wrapper { display: flex; justify-content: center; align-items: center; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+.login-card { width: 400px; padding: 20px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15); }
+.login-header { text-align: center; margin-bottom: 10px; }
+.login-header h2 { margin: 0; color: #303133; font-size: 22px; }
+.login-header p { margin: 6px 0 0; color: #909399; font-size: 13px; }
+.login-btn { width: 100%; margin-top: 10px; }
+
+.shell { min-height: 100vh; background: #f5f7fa; }
+.el-header { display: flex; align-items: center; gap: 36px; background: white; border-bottom: 1px solid #ddd; }
+.el-menu { border: 0; flex: 1; }
+.user-info { display: flex; align-items: center; gap: 12px; }
+.username { font-size: 14px; color: #606266; font-weight: 500; }
+.panel { background: white; padding: 24px; border-radius: 8px; }
+.dropzone { margin: 20px 0; padding: 42px; border: 2px dashed #a8abb2; border-radius: 8px; text-align: center; color: #606266; }
+.spaced { margin-top: 20px; }
+.result-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.right { float: right; }
+.field-help { color: #909399; font-size: 13px; }
+.field-row { display: grid; grid-template-columns: 1.1fr 1.1fr 100px 1.4fr 70px repeat(3, auto); gap: 8px; margin: 8px 0; }
+.raw-text { max-height: 60vh; overflow: auto; white-space: pre-wrap; }
+@media (max-width: 800px) { .result-layout { grid-template-columns: 1fr; } .field-row { grid-template-columns: 1fr; } }
 </style>

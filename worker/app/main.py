@@ -1,8 +1,8 @@
 import json
 import logging
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -12,12 +12,11 @@ from .config import GEMINI_CONCURRENCY, OCR_CONCURRENCY, WORKER_POLL_SECONDS
 from .database import SessionLocal
 from .models import Document, OCRResult, ProcessingLog, Record, TemplateField
 from .services.ai.gemini import GeminiProvider
-from .services.ocr.paddleocr_provider import PaddleOCRProvider
+from .services.ocr.alibaba_ocr_provider import AlibabaOCRProvider
 from .services.pdf_extractor import extract_pdf_text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-ocr_local = threading.local()
 
 
 def log(db, document_id: int, stage: str, level: str, message: str):
@@ -34,12 +33,9 @@ def mark_failed(document_id: int, stage: str, error: Exception):
             db.commit()
 
 
-def get_ocr_provider() -> PaddleOCRProvider:
-    provider = getattr(ocr_local, "provider", None)
-    if provider is None:
-        provider = PaddleOCRProvider()
-        ocr_local.provider = provider
-    return provider
+@lru_cache
+def get_ocr_provider() -> AlibabaOCRProvider:
+    return AlibabaOCRProvider()
 
 
 def validate_data(data: dict[str, Any], fields: list[TemplateField]) -> dict[str, Any]:
@@ -85,9 +81,9 @@ def extract_ocr(document_id: int) -> int | None:
                 if not raw_text:
                     raise ValueError("PDF has no extractable text; scanned PDF OCR is not supported in V1")
             else:
-                raw_text, engine = get_ocr_provider().extract(path), "paddleocr"
+                raw_text, engine = get_ocr_provider().extract(path), "alibaba_ocr"
                 if not raw_text:
-                    raise ValueError("PaddleOCR returned no text")
+                    raise ValueError("Alibaba Cloud OCR returned no text")
             ocr_result = db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
             if ocr_result:
                 ocr_result.engine, ocr_result.raw_text = engine, raw_text

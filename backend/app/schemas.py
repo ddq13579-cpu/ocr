@@ -37,3 +37,8 @@ class TemplateOutput(TemplateInput):
 
 class RecordUpdate(BaseModel):
     json_data: dict[str, Any]
+
+
+class LoginInput(BaseModel):
+    username: str
+    password: str

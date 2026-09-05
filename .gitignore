@@ -10,5 +10,3 @@ data/database/*
 !data/database/.gitkeep
 data/exports/*
 !data/exports/.gitkeep
-data/paddle_models/*
-!data/paddle_models/.gitkeep

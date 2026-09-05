@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import mimetypes
 import re
@@ -7,18 +8,41 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
-from sqlalchemy import select
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session, selectinload
 from openpyxl import Workbook
 
-from .config import EXPORT_DIR, SUPPORTED_EXTENSIONS, UPLOAD_DIR
+from .config import AUTH_PASSWORD, AUTH_USERNAME, EXPORT_DIR, SECRET_KEY, SUPPORTED_EXTENSIONS, UPLOAD_DIR
 from .database import Base, engine, get_db
 from .models import Document, OCRResult, ProcessingLog, Record, Template, TemplateField
-from .schemas import RecordUpdate, TemplateInput, TemplateOutput
+from .schemas import LoginInput, RecordUpdate, TemplateInput, TemplateOutput
 
 app = FastAPI(title="Document AI")
+
+
+def generate_valid_token():
+    return hmac.new(SECRET_KEY.encode(), f"{AUTH_USERNAME}:{AUTH_PASSWORD}".encode(), hashlib.sha256).hexdigest()
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path not in {"/api/health", "/api/auth/login"}:
+        auth_header = request.headers.get("Authorization")
+        query_token = request.query_params.get("token")
+        token = None
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+        elif query_token:
+            token = query_token
+
+        valid_token = generate_valid_token()
+        if not token or not hmac.compare_digest(token, valid_token):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -26,6 +50,12 @@ def startup():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(engine)
+    with engine.connect() as conn:
+        inspector = inspect(engine)
+        columns = [c["name"] for c in inspector.get_columns("documents")]
+        if "folder_level_3" not in columns:
+            conn.execute(text("ALTER TABLE documents ADD COLUMN folder_level_3 VARCHAR(255)"))
+            conn.commit()
 
 
 def template_or_404(template_id: int, db: Session) -> Template:
@@ -35,11 +65,12 @@ def template_or_404(template_id: int, db: Session) -> Template:
     return template
 
 
-def assign_template(template: Template, payload: TemplateInput):
+def assign_template(template: Template, payload: TemplateInput, db: Session):
     template.name, template.description = payload.name, payload.description
     template.fields.clear()
+    db.flush()
     for index, field in enumerate(payload.fields):
-        template.fields.append(TemplateField(**field.model_dump(exclude={"sort_order"}), sort_order=field.sort_order or index))
+        template.fields.append(TemplateField(**field.model_dump(exclude={"sort_order"}), sort_order=index))
 
 
 def safe_relative_path(value: str, fallback: str) -> PurePosixPath:
@@ -55,6 +86,19 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/api/auth/login")
+def login(payload: LoginInput):
+    if payload.username == AUTH_USERNAME and payload.password == AUTH_PASSWORD:
+        token = generate_valid_token()
+        return {"token": token, "username": payload.username}
+    raise HTTPException(status_code=401, detail="账号或密码错误")
+
+
+@app.get("/api/auth/check")
+def check_auth():
+    return {"status": "authenticated", "username": AUTH_USERNAME}
+
+
 @app.get("/api/templates", response_model=list[TemplateOutput])
 def list_templates(db: Session = Depends(get_db)):
     return db.scalars(select(Template).options(selectinload(Template.fields)).order_by(Template.name)).all()
@@ -65,7 +109,7 @@ def create_template(payload: TemplateInput, db: Session = Depends(get_db)):
     if db.scalar(select(Template).where(Template.name == payload.name)):
         raise HTTPException(409, "Template name already exists")
     template = Template()
-    assign_template(template, payload)
+    assign_template(template, payload, db)
     db.add(template)
     db.commit()
     db.refresh(template)
@@ -83,7 +127,7 @@ def update_template(template_id: int, payload: TemplateInput, db: Session = Depe
     duplicate = db.scalar(select(Template).where(Template.name == payload.name, Template.id != template_id))
     if duplicate:
         raise HTTPException(409, "Template name already exists")
-    assign_template(template, payload)
+    assign_template(template, payload, db)
     db.commit()
     db.refresh(template)
     return template
@@ -92,8 +136,8 @@ def update_template(template_id: int, payload: TemplateInput, db: Session = Depe
 @app.delete("/api/templates/{template_id}", status_code=204)
 def delete_template(template_id: int, db: Session = Depends(get_db)):
     template = template_or_404(template_id, db)
-    if db.scalar(select(Document).where(Document.template_id == template_id).limit(1)):
-        raise HTTPException(409, "Template is used by uploaded documents")
+    db.query(Record).filter(Record.template_id == template_id).delete(synchronize_session=False)
+    db.query(Document).filter(Document.template_id == template_id).update({Document.template_id: None}, synchronize_session=False)
     db.delete(template)
     db.commit()
 
@@ -138,7 +182,9 @@ async def upload_files(
         document = Document(
             filename=filename, relative_path=str(relative_path), file_path=str(target), file_type=suffix[1:].upper(),
             mime_type=file.content_type or mimetypes.guess_type(filename)[0] or "", file_size=size, sha256=checksum,
-            folder_level_1=parts[0] if parts else None, folder_level_2=parts[1] if len(parts) > 1 else None,
+            folder_level_1=parts[0] if parts else None,
+            folder_level_2=parts[1] if len(parts) > 1 else None,
+            folder_level_3=parts[2] if len(parts) > 2 else None,
             status="pending", template_id=template_id,
         )
         db.add(document)
@@ -182,6 +228,26 @@ def download_document(document_id: int, db: Session = Depends(get_db)):
     if not document or not Path(document.file_path).is_file():
         raise HTTPException(404, "Document file not found")
     return FileResponse(document.file_path, filename=document.filename, media_type=document.mime_type)
+
+
+@app.delete("/api/documents", status_code=200)
+def delete_all_documents(db: Session = Depends(get_db)):
+    documents = db.scalars(select(Document)).all()
+    deleted_count = 0
+    skipped_count = 0
+    upload_root = UPLOAD_DIR.resolve()
+    for document in documents:
+        if document.status in {"processing", "ai_processing"}:
+            skipped_count += 1
+            continue
+        file_path = Path(document.file_path).resolve()
+        db.query(ProcessingLog).filter(ProcessingLog.document_id == document.id).delete()
+        db.delete(document)
+        deleted_count += 1
+        if file_path.is_relative_to(upload_root):
+            file_path.unlink(missing_ok=True)
+    db.commit()
+    return {"deleted": deleted_count, "skipped": skipped_count}
 
 
 @app.delete("/api/documents/{document_id}", status_code=204)
@@ -242,12 +308,30 @@ def export_excel(template_id: int, db: Session = Depends(get_db)):
     sheet = workbook.active
     sheet.title = template.name[:31]
     fields = sorted(template.fields, key=lambda field: field.sort_order)
-    sheet.append(["folder_level_1", "folder_level_2", "filename", *[field.field_name for field in fields]])
+    
+    doc_folder_parts = []
+    max_levels = 2
     for record in records:
         document = db.get(Document, record.document_id)
+        if document:
+            parts = list(PurePosixPath(document.relative_path).parts[:-1]) if document.relative_path else []
+            doc_folder_parts.append((record, document, parts))
+            if len(parts) > max_levels:
+                max_levels = len(parts)
+        else:
+            doc_folder_parts.append((record, None, []))
+
+    folder_headers = [f"folder_level_{i+1}" for i in range(max_levels)]
+    sheet.append([*folder_headers, *[field.field_name for field in fields]])
+
+    for record, document, parts in doc_folder_parts:
+        if not document:
+            continue
         data = json.loads(record.json_data)
-        sheet.append([document.folder_level_1 or "", document.folder_level_2 or "", document.filename,
-                      *[data.get(field.field_key) for field in fields]])
+        folder_values = [parts[i] if i < len(parts) else "" for i in range(max_levels)]
+        sheet.append([*folder_values, *[data.get(field.field_key) for field in fields]])
+
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     output = EXPORT_DIR / f"{re.sub(r'[^A-Za-z0-9_-]', '_', template.name)}-{datetime.utcnow():%Y%m%d%H%M%S}.xlsx"
     workbook.save(output)
     return FileResponse(output, filename=output.name, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
